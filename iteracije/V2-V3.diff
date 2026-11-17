@@ -1,0 +1,338 @@
+diff --git "a/V2\\align.hpp" "b/V3\\align.hpp"
+index 06e6bfa..a2ed5db 100644
+--- "a/V2\\align.hpp"
++++ "b/V3\\align.hpp"
+@@ -8,6 +8,7 @@
+ #include <string>
+ #include <string_view>
+ #include <vector>
++#include "bases.hpp"
+ 
+ namespace sw {
+ 
+@@ -26,6 +27,10 @@ inline int sub(char x, char y, const Scoring& sc) {
+     return (x == y && x != 'N') ? sc.match : sc.mismatch;   // N se tretira kao nepodudaranje
+ }
+ 
++inline int sub(Base x, Base y, const Scoring& sc) {
++    return (x == y && x != BASE_N) ? sc.match : sc.mismatch;
++}
++
+ inline std::string makeCigar(const std::string& a, const std::string& b) {
+     std::string out; char cur = 0; int cnt = 0;
+     for (size_t k = 0; k < a.size(); ++k) {
+@@ -43,8 +48,9 @@ struct SwWorkspace {
+ };
+ 
+ // Smith-Waterman: dva reda skorova i puna matrica smjerova za traceback.
+-inline Alignment smithWaterman(const std::string& X, std::string_view Y,
+-                               const Scoring& sc, SwWorkspace& workspace) {
++template <class Sequence>
++inline Alignment smithWatermanImpl(Sequence X, Sequence Y, const Scoring& sc,
++                                   SwWorkspace& workspace) {
+     const int n = (int)X.size(), m = (int)Y.size();
+     const size_t width = (size_t)m + 1;
+ 
+@@ -87,14 +93,14 @@ inline Alignment smithWaterman(const std::string& X, std::string_view Y,
+         if (direction == STOP) break;
+ 
+         if (direction == DIAG) {
+-            result.a += X[--i];
+-            result.b += Y[--j];
++            result.a += decodeBase(X[--i]);
++            result.b += decodeBase(Y[--j]);
+         } else if (direction == UP) {
+-            result.a += X[--i];
++            result.a += decodeBase(X[--i]);
+             result.b += '-';
+         } else {
+             result.a += '-';
+-            result.b += Y[--j];
++            result.b += decodeBase(Y[--j]);
+         }
+     }
+ 
+@@ -106,6 +112,16 @@ inline Alignment smithWaterman(const std::string& X, std::string_view Y,
+     return result;
+ }
+ 
++inline Alignment smithWaterman(EncodedView X, EncodedView Y, const Scoring& sc,
++                               SwWorkspace& workspace) {
++    return smithWatermanImpl(X, Y, sc, workspace);
++}
++
++inline Alignment smithWaterman(const std::string& X, std::string_view Y, const Scoring& sc,
++                               SwWorkspace& workspace) {
++    return smithWatermanImpl(std::string_view(X), Y, sc, workspace);
++}
++
+ inline Alignment smithWaterman(const std::string& X, std::string_view Y, const Scoring& sc) {
+     SwWorkspace workspace;
+     return smithWaterman(X, Y, sc, workspace);
+diff --git "a/V3\\bases.hpp" "b/V3\\bases.hpp"
+new file mode 100644
+index 0000000..8694bbf
+--- /dev/null
++++ "b/V3\\bases.hpp"
+@@ -0,0 +1,59 @@
++#pragma once
++#include <cstdint>
++#include <string>
++#include <string_view>
++
++namespace sw {
++
++using Base = uint8_t;
++constexpr Base BASE_N = 'N';
++
++// Zamijeni A/C/G/T s bajtovima 0..3. Ostali znakovi zadržavaju identitet.
++inline char remapBaseByte(char c) {
++    switch (c) {
++        case 'A': return 0;
++        case 'C': return 1;
++        case 'G': return 2;
++        case 'T': return 3;
++        case 0: return 'A';
++        case 1: return 'C';
++        case 2: return 'G';
++        case 3: return 'T';
++        default: return c;
++    }
++}
++
++inline Base encodeBase(char c) { return static_cast<Base>(remapBaseByte(c)); }
++inline char decodeBase(Base b) { return remapBaseByte(static_cast<char>(b)); }
++inline char decodeBase(char c) { return c; }
++inline bool isCanonical(Base b) { return b < 4; }
++
++struct EncodedView {
++    std::string_view bytes;
++
++    size_t size() const { return bytes.size(); }
++    Base operator[](size_t i) const { return static_cast<Base>(bytes[i]); }
++    EncodedView substr(size_t start, size_t length) const {
++        return {bytes.substr(start, length)};
++    }
++};
++
++inline void appendEncoded(std::string_view sequence, std::string& out) {
++    for (char c : sequence) out.push_back(static_cast<char>(encodeBase(c)));
++}
++
++inline std::string encodeSequence(std::string_view sequence) {
++    std::string out;
++    out.reserve(sequence.size());
++    appendEncoded(sequence, out);
++    return out;
++}
++
++inline void appendReverseComplement(EncodedView sequence, std::string& out) {
++    for (size_t i = sequence.size(); i > 0; --i) {
++        const Base b = sequence[i - 1];
++        out.push_back(static_cast<char>(isCanonical(b) ? 3 - b : b));
++    }
++}
++
++}  // namespace sw
+diff --git "a/V2\\mapper.cpp" "b/V3\\mapper.cpp"
+index 9f2f725..536ccae 100644
+--- "a/V2\\mapper.cpp"
++++ "b/V3\\mapper.cpp"
+@@ -33,17 +33,22 @@ int main(int argc, char** argv) {
+     if (p.k < 1 || p.k > 16) { std::cerr << "k mora biti u [1,16]\n"; return 1; }
+ 
+     auto T0 = clk::now(); auto t = T0;
+-    auto refs = readSequences(o["ref"]);
+-    auto reads = readSequences(o["reads"]);
+-    if (refs.empty()) { std::cerr << "Prazna referenca\n"; return 1; }
+-    const std::string& ref = refs[0].seq;                  // radi se s prvom sekvencom reference
++    std::string refBases;
++    {
++        const auto refs = readSequences(o["ref"]);
++        if (refs.empty()) { std::cerr << "Prazna referenca\n"; return 1; }
++        refBases = encodeSequence(refs[0].seq);
++    }
++    const EncodedView ref{refBases};
++    const ReadBatch reads = makeBatch(readSequences(o["reads"]));
+     double tLoad = since(t);
+ 
+     t = clk::now(); KmerIndex idx; idx.build(ref, p.k); double tIndex = since(t);
+ 
+     Stats st; std::vector<MapResult> res(reads.size());
+     t = clk::now();
+-    for (size_t i = 0; i < reads.size(); ++i) res[i] = mapRead(reads[i].seq, idx, ref, p, st);
++    for (size_t i = 0; i < reads.size(); ++i)
++        res[i] = mapRead(reads.sequence(i), reads.sequence(i, true), idx, ref, p, st);
+     double tMap = since(t);
+ 
+     if (profile) {
+@@ -69,7 +74,7 @@ int main(int argc, char** argv) {
+       if (!f) { std::cerr << "Ne mogu pisati u " << o["out"] << " (napravi direktorij)\n"; return 1; }
+       f << "read_id\tstrand\tpos\tscore\tcigar\tstatus\n";
+       for (size_t i = 0; i < reads.size(); ++i)
+-          f << reads[i].id << '\t' << res[i].strand << '\t' << res[i].pos << '\t' << res[i].score << '\t'
++          f << reads.ids[i] << '\t' << res[i].strand << '\t' << res[i].pos << '\t' << res[i].score << '\t'
+             << res[i].cigar << '\t' << res[i].status << '\n'; }
+     double tOut = since(t), tTotal = since(T0);
+ 
+@@ -77,10 +82,11 @@ int main(int argc, char** argv) {
+     for (size_t i = 0; i < reads.size(); ++i) {
+         const auto& r = res[i];
+         if (r.status == "unmapped") ++nUn; else if (r.status == "ambiguous") ++nAmb; else ++nMapped;
+-        size_t a = reads[i].id.find("|pos="), b = reads[i].id.find("|strand=");
++        const auto& id = reads.ids[i];
++        size_t a = id.find("|pos="), b = id.find("|strand=");
+         if (a != std::string::npos && b != std::string::npos) {
+             ++nTruth;
+-            long tp = std::stol(reads[i].id.substr(a + 5, b - a - 5)); char ts = reads[i].id[b + 8];
++            long tp = std::stol(id.substr(a + 5, b - a - 5)); char ts = id[b + 8];
+             if (r.status != "unmapped" && r.strand == ts && std::llabs((long long)r.pos - tp) <= tol) ++nCorrect;
+         }
+     }
+diff --git "a/V2\\mapper.hpp" "b/V3\\mapper.hpp"
+index cf7e79c..309b415 100644
+--- "a/V2\\mapper.hpp"
++++ "b/V3\\mapper.hpp"
+@@ -7,11 +7,13 @@
+ #include <utility>
+ #include <vector>
+ #include "align.hpp"
++#include "fasta.hpp"
+ 
+ namespace sw {
+ 
+ inline int enc(char c) {
+-    switch (c) { case 'A': return 0; case 'C': return 1; case 'G': return 2; case 'T': return 3; default: return -1; }
++    const Base base = encodeBase(c);
++    return isCanonical(base) ? base : -1;
+ }
+ inline std::string revComp(const std::string& s) {
+     std::string r(s.rbegin(), s.rend());
+@@ -20,22 +22,58 @@ inline std::string revComp(const std::string& s) {
+     return r;
+ }
+ 
++// Oba lanca svakog reada koriste isti par granica u dva kontinuirana bafera.
++struct ReadBatch {
++    std::string bases, reverseBases;
++    std::vector<size_t> offsets{0};
++    std::vector<std::string> ids;
++
++    size_t size() const { return ids.size(); }
++    EncodedView sequence(size_t i, bool reverse = false) const {
++        const std::string& buffer = reverse ? reverseBases : bases;
++        return EncodedView{buffer}.substr(offsets[i], offsets[i + 1] - offsets[i]);
++    }
++};
++
++inline ReadBatch makeBatch(std::vector<Record> records) {
++    ReadBatch batch;
++    size_t total = 0;
++    for (const auto& record : records) total += record.seq.size();
++    batch.bases.reserve(total);
++    batch.reverseBases.reserve(total);
++    batch.offsets.reserve(records.size() + 1);
++    batch.ids.reserve(records.size());
++    for (auto& record : records) {
++        const size_t start = batch.bases.size();
++        appendEncoded(record.seq, batch.bases);
++        appendReverseComplement(EncodedView{batch.bases}.substr(start, record.seq.size()),
++                                batch.reverseBases);
++        batch.offsets.push_back(batch.bases.size());
++        batch.ids.push_back(std::move(record.id));
++    }
++    return batch;
++}
++
+ // Indeks: sortiran niz (kmer << 32 | pozicija). Podržava k <= 16 i reference do 4 Gb.
+ struct KmerIndex {
+     int k = 12;
+     std::vector<uint64_t> e;
+-    void build(const std::string& ref, int k_) {
++    void build(EncodedView ref, int k_) {
+         k = k_; e.clear();
+         const uint64_t mask = (1ULL << (2 * k)) - 1;
+         uint64_t code = 0; int valid = 0;
+         for (size_t i = 0; i < ref.size(); ++i) {
+-            int c = enc(ref[i]);
+-            if (c < 0) { valid = 0; code = 0; continue; }       // k-mere s N se preskaču
++            const Base c = ref[i];
++            if (!isCanonical(c)) { valid = 0; code = 0; continue; }
+             code = ((code << 2) | (uint64_t)c) & mask;
+             if (++valid >= k) e.push_back((code << 32) | (uint32_t)(i - k + 1));
+         }
+         std::sort(e.begin(), e.end());
+     }
++    void build(const std::string& ref, int k_) {
++        const auto encoded = encodeSequence(ref);
++        build(EncodedView{encoded}, k_);
++    }
+     std::pair<std::vector<uint64_t>::const_iterator, std::vector<uint64_t>::const_iterator>
+     lookup(uint64_t code) const {
+         auto lo = std::lower_bound(e.begin(), e.end(), code << 32);
+@@ -71,14 +109,14 @@ struct Stats {
+ };
+ 
+ // Seeding: sve k-mere reada -> pozicije u indeksu -> glasanje po dijagonali (p - offset).
+-inline std::vector<std::pair<int64_t, int>> findCandidates(const std::string& seq, const KmerIndex& idx, const MapParams& p) {
++inline std::vector<std::pair<int64_t, int>> findCandidates(EncodedView seq, const KmerIndex& idx, const MapParams& p) {
+     std::vector<int64_t> diags;
+     const int k = idx.k;
+     const uint64_t mask = (1ULL << (2 * k)) - 1;
+     uint64_t code = 0; int valid = 0;
+     for (size_t i = 0; i < seq.size(); ++i) {
+-        int c = enc(seq[i]);
+-        if (c < 0) { valid = 0; code = 0; continue; }
++        const Base c = seq[i];
++        if (!isCanonical(c)) { valid = 0; code = 0; continue; }
+         code = ((code << 2) | (uint64_t)c) & mask;
+         if (++valid < k) continue;
+         int64_t off = (int64_t)i - k + 1;
+@@ -104,16 +142,20 @@ inline std::vector<std::pair<int64_t, int>> findCandidates(const std::string& se
+     return out;
+ }
+ 
++inline std::vector<std::pair<int64_t, int>> findCandidates(const std::string& seq, const KmerIndex& idx, const MapParams& p) {
++    const auto encoded = encodeSequence(seq);
++    return findCandidates(EncodedView{encoded}, idx, p);
++}
++
+ struct Hit { int score; int64_t pos; char strand; std::string cigar; };
+ 
+-inline MapResult mapRead(const std::string& read, const KmerIndex& idx, const std::string& ref,
++inline MapResult mapRead(EncodedView read, EncodedView rc, const KmerIndex& idx, EncodedView ref,
+                          const MapParams& p, Stats& st) {
+     using clk = std::chrono::steady_clock;
+     auto secs = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double>(b - a).count(); };
+     std::vector<Hit> hits; int ncand = 0;
+-    const std::string rc = revComp(read);
+     for (int s = 0; s < 2; ++s) {                       // oba lanca: read i njegov reverse-complement
+-        const std::string& seq = (s == 0) ? read : rc;
++        const auto seq = (s == 0) ? read : rc;
+         auto t0 = clk::now();
+         auto cands = findCandidates(seq, idx, p);
+         auto t1 = clk::now(); st.seedSec += secs(t0, t1);
+@@ -122,7 +164,7 @@ inline MapResult mapRead(const std::string& read, const KmerIndex& idx, const st
+             int64_t rs = std::max<int64_t>(0, c.first - p.margin);
+             int64_t re = std::min<int64_t>((int64_t)ref.size(), c.first + (int64_t)seq.size() + p.margin);
+             if (re <= rs) continue;
+-            const auto region = std::string_view(ref).substr((size_t)rs, (size_t)(re - rs));
++            const auto region = ref.substr((size_t)rs, (size_t)(re - rs));
+             Alignment a = smithWaterman(seq, region, p.sc, st.swWorkspace);   // extension
+             st.cells += (uint64_t)seq.size() * (uint64_t)(re - rs); ++st.extensions;
+             if (a.score <= 0) continue;
+@@ -147,4 +189,14 @@ inline MapResult mapRead(const std::string& read, const KmerIndex& idx, const st
+     return r;
+ }
+ 
++inline MapResult mapRead(const std::string& read, const KmerIndex& idx, const std::string& ref,
++                         const MapParams& p, Stats& st) {
++    const auto encodedRead = encodeSequence(read);
++    const auto encodedRef = encodeSequence(ref);
++    std::string reverse;
++    reverse.reserve(encodedRead.size());
++    appendReverseComplement(EncodedView{encodedRead}, reverse);
++    return mapRead(EncodedView{encodedRead}, EncodedView{reverse}, idx, EncodedView{encodedRef}, p, st);
++}
++
+ }  // namespace sw

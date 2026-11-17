@@ -1,0 +1,202 @@
+// mapper.hpp: k-mer indeks, seeding, extension (Smith-Waterman) i izbor najboljeg mapiranja
+#pragma once
+#include <chrono>
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <utility>
+#include <vector>
+#include "align.hpp"
+#include "fasta.hpp"
+
+namespace sw {
+
+inline int enc(char c) {
+    const Base base = encodeBase(c);
+    return isCanonical(base) ? base : -1;
+}
+inline std::string revComp(const std::string& s) {
+    std::string r(s.rbegin(), s.rend());
+    for (char& c : r) switch (c) { case 'A': c = 'T'; break; case 'C': c = 'G'; break;
+                                   case 'G': c = 'C'; break; case 'T': c = 'A'; break; default: break; }
+    return r;
+}
+
+// Oba lanca svakog reada koriste isti par granica u dva kontinuirana bafera.
+struct ReadBatch {
+    std::string bases, reverseBases;
+    std::vector<size_t> offsets{0};
+    std::vector<std::string> ids;
+
+    size_t size() const { return ids.size(); }
+    EncodedView sequence(size_t i, bool reverse = false) const {
+        const std::string& buffer = reverse ? reverseBases : bases;
+        return EncodedView{buffer}.substr(offsets[i], offsets[i + 1] - offsets[i]);
+    }
+};
+
+inline ReadBatch makeBatch(std::vector<Record> records) {
+    ReadBatch batch;
+    size_t total = 0;
+    for (const auto& record : records) total += record.seq.size();
+    batch.bases.reserve(total);
+    batch.reverseBases.reserve(total);
+    batch.offsets.reserve(records.size() + 1);
+    batch.ids.reserve(records.size());
+    for (auto& record : records) {
+        const size_t start = batch.bases.size();
+        appendEncoded(record.seq, batch.bases);
+        appendReverseComplement(EncodedView{batch.bases}.substr(start, record.seq.size()),
+                                batch.reverseBases);
+        batch.offsets.push_back(batch.bases.size());
+        batch.ids.push_back(std::move(record.id));
+    }
+    return batch;
+}
+
+// Indeks: sortiran niz (kmer << 32 | pozicija). Podržava k <= 16 i reference do 4 Gb.
+struct KmerIndex {
+    int k = 12;
+    std::vector<uint64_t> e;
+    void build(EncodedView ref, int k_) {
+        k = k_; e.clear();
+        const uint64_t mask = (1ULL << (2 * k)) - 1;
+        uint64_t code = 0; int valid = 0;
+        for (size_t i = 0; i < ref.size(); ++i) {
+            const Base c = ref[i];
+            if (!isCanonical(c)) { valid = 0; code = 0; continue; }
+            code = ((code << 2) | (uint64_t)c) & mask;
+            if (++valid >= k) e.push_back((code << 32) | (uint32_t)(i - k + 1));
+        }
+        std::sort(e.begin(), e.end());
+    }
+    void build(const std::string& ref, int k_) {
+        const auto encoded = encodeSequence(ref);
+        build(EncodedView{encoded}, k_);
+    }
+    std::pair<std::vector<uint64_t>::const_iterator, std::vector<uint64_t>::const_iterator>
+    lookup(uint64_t code) const {
+        auto lo = std::lower_bound(e.begin(), e.end(), code << 32);
+        auto hi = std::lower_bound(lo, e.end(), (code + 1) << 32);
+        return {lo, hi};
+    }
+};
+
+struct MapParams {
+    int k = 12;
+    int margin = 20;            // margina oko kandidata; ujedno tolerancija za pomak dijagonale (indeli)
+    int minVotes = 2;           // minimalan broj seed pogodaka za kandidata
+    int maxOcc = 500;           // k-mere s više pojavljivanja se preskaču (ponavljajuće regije)
+    int maxCand = 5;            // najviše kandidata po lancu
+    int stride = 1;             // razmak između seedova u readu
+    double minScoreFrac = 0.5;  // minimalni skor = frac * dužina * match
+    Scoring sc;
+};
+
+struct MapResult {
+    std::string status = "unmapped";   // mapped | ambiguous | unmapped
+    char strand = '*';
+    int64_t pos = -1;                  // 0-indeksirana pozicija na referenci
+    int score = 0;
+    std::string cigar = "*";
+    int candidates = 0;
+};
+
+struct Stats {
+    double seedSec = 0, extSec = 0;
+    uint64_t cells = 0, extensions = 0;
+    SwWorkspace swWorkspace;
+};
+
+// Seeding: sve k-mere reada -> pozicije u indeksu -> glasanje po dijagonali (p - offset).
+inline std::vector<std::pair<int64_t, int>> findCandidates(EncodedView seq, const KmerIndex& idx, const MapParams& p) {
+    std::vector<int64_t> diags;
+    const int k = idx.k;
+    const uint64_t mask = (1ULL << (2 * k)) - 1;
+    uint64_t code = 0; int valid = 0;
+    for (size_t i = 0; i < seq.size(); ++i) {
+        const Base c = seq[i];
+        if (!isCanonical(c)) { valid = 0; code = 0; continue; }
+        code = ((code << 2) | (uint64_t)c) & mask;
+        if (++valid < k) continue;
+        int64_t off = (int64_t)i - k + 1;
+        if (off % p.stride) continue;
+        auto r = idx.lookup(code);
+        if (r.second - r.first > p.maxOcc) continue;
+        for (auto it = r.first; it != r.second; ++it) diags.push_back((int64_t)(uint32_t)(*it) - off);
+    }
+    std::sort(diags.begin(), diags.end());
+    struct Cl { int64_t diag; int votes; int bestRun; };
+    std::vector<Cl> cl; int64_t last = 0;
+    for (size_t i = 0; i < diags.size();) {
+        size_t j = i; while (j < diags.size() && diags[j] == diags[i]) ++j;
+        int cnt = (int)(j - i); int64_t d = diags[i];
+        if (cl.empty() || d - last > p.margin) cl.push_back({d, cnt, cnt});
+        else { Cl& c = cl.back(); c.votes += cnt; if (cnt > c.bestRun) { c.bestRun = cnt; c.diag = d; } }
+        last = d; i = j;
+    }
+    std::vector<std::pair<int64_t, int>> out;
+    for (auto& c : cl) if (c.votes >= p.minVotes) out.push_back({c.diag, c.votes});
+    std::sort(out.begin(), out.end(), [](auto& x, auto& y) { return x.second > y.second; });
+    if ((int)out.size() > p.maxCand) out.resize(p.maxCand);
+    return out;
+}
+
+inline std::vector<std::pair<int64_t, int>> findCandidates(const std::string& seq, const KmerIndex& idx, const MapParams& p) {
+    const auto encoded = encodeSequence(seq);
+    return findCandidates(EncodedView{encoded}, idx, p);
+}
+
+struct Hit { int score; int64_t pos; char strand; std::string cigar; };
+
+inline MapResult mapRead(EncodedView read, EncodedView rc, const KmerIndex& idx, EncodedView ref,
+                         const MapParams& p, Stats& st) {
+    using clk = std::chrono::steady_clock;
+    auto secs = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double>(b - a).count(); };
+    std::vector<Hit> hits; int ncand = 0;
+    for (int s = 0; s < 2; ++s) {                       // oba lanca: read i njegov reverse-complement
+        const auto seq = (s == 0) ? read : rc;
+        auto t0 = clk::now();
+        auto cands = findCandidates(seq, idx, p);
+        auto t1 = clk::now(); st.seedSec += secs(t0, t1);
+        ncand += (int)cands.size();
+        for (auto& c : cands) {
+            int64_t rs = std::max<int64_t>(0, c.first - p.margin);
+            int64_t re = std::min<int64_t>((int64_t)ref.size(), c.first + (int64_t)seq.size() + p.margin);
+            if (re <= rs) continue;
+            const auto region = ref.substr((size_t)rs, (size_t)(re - rs));
+            Alignment a = smithWaterman(seq, region, p.sc, st.swWorkspace);   // extension
+            st.cells += (uint64_t)seq.size() * (uint64_t)(re - rs); ++st.extensions;
+            if (a.score <= 0) continue;
+            std::string cig;
+            if (a.startX > 0) cig += std::to_string(a.startX) + "S";                         // soft clip
+            cig += a.cigar;
+            if ((int)seq.size() > a.endX) cig += std::to_string((int)seq.size() - a.endX) + "S";
+            hits.push_back({a.score, rs + a.startY, s == 0 ? '+' : '-', cig});
+        }
+        st.extSec += secs(t1, clk::now());
+    }
+    MapResult r; r.candidates = ncand;
+    if (hits.empty()) return r;
+    std::sort(hits.begin(), hits.end(), [](const Hit& x, const Hit& y) { return x.score > y.score; });
+    const Hit& b = hits[0];
+    if (b.score < (int)(p.minScoreFrac * read.size() * p.sc.match)) return r;
+    r.status = "mapped"; r.strand = b.strand; r.pos = b.pos; r.score = b.score; r.cigar = b.cigar;
+    for (size_t i = 1; i < hits.size(); ++i)             // višeznačno: jednako dobar hit na drugom mjestu
+        if (hits[i].score >= b.score && (hits[i].strand != b.strand || std::llabs(hits[i].pos - b.pos) > p.margin)) {
+            r.status = "ambiguous"; break;
+        }
+    return r;
+}
+
+inline MapResult mapRead(const std::string& read, const KmerIndex& idx, const std::string& ref,
+                         const MapParams& p, Stats& st) {
+    const auto encodedRead = encodeSequence(read);
+    const auto encodedRef = encodeSequence(ref);
+    std::string reverse;
+    reverse.reserve(encodedRead.size());
+    appendReverseComplement(EncodedView{encodedRead}, reverse);
+    return mapRead(EncodedView{encodedRead}, EncodedView{reverse}, idx, EncodedView{encodedRef}, p, st);
+}
+
+}  // namespace sw
