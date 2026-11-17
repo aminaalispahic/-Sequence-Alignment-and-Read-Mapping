@@ -1,0 +1,152 @@
+diff --git "a/V3\\demo.cpp" "b/V4\\demo.cpp"
+index 9930e8a..912d2c2 100644
+--- "a/V3\\demo.cpp"
++++ "b/V4\\demo.cpp"
+@@ -37,10 +37,12 @@ int main() {
+     // ---- 3) INDEKS ----
+     MapParams p; p.k = 8; p.margin = 10; p.minVotes = 2;
+     KmerIndex idx; idx.build(ref, p.k);
+-    cout << "\n=== INDEKS: k=" << p.k << ", " << idx.e.size() << " k-mera u indeksu ===\n";
++    cout << "\n=== INDEKS: k=" << p.k << ", " << idx.size() << " k-mera u indeksu ===\n";
+     { std::string km = ref.substr(40, p.k); uint64_t code = 0; for (char c : km) code = (code << 2) | enc(c);
+       auto r = idx.lookup(code);
+-      cout << "  lookup(" << km << ") -> pozicije:"; for (auto it = r.first; it != r.second; ++it) cout << ' ' << (uint32_t)(*it); cout << "\n"; }
++      cout << "  lookup(" << km << ") -> pozicije:";
++      r.forEach([](uint32_t pos) { cout << ' ' << pos; });
++      cout << "\n"; }
+ 
+     // ---- 4) MAPIRANJE svakog reada ----
+     cout << "\n=== MAPIRANJE ===\n";
+diff --git "a/V3\\mapper.hpp" "b/V4\\mapper.hpp"
+index 309b415..388ac21 100644
+--- "a/V3\\mapper.hpp"
++++ "b/V4\\mapper.hpp"
+@@ -1,7 +1,10 @@
+ // mapper.hpp: k-mer indeks, seeding, extension (Smith-Waterman) i izbor najboljeg mapiranja
+ #pragma once
++#include <algorithm>
+ #include <chrono>
++#include <cstddef>
+ #include <cstdint>
++#include <limits>
+ #include <string>
+ #include <string_view>
+ #include <utility>
+@@ -54,31 +57,89 @@ inline ReadBatch makeBatch(std::vector<Record> records) {
+     return batch;
+ }
+ 
+-// Indeks: sortiran niz (kmer << 32 | pozicija). Podržava k <= 16 i reference do 4 Gb.
++struct KmerPositions {
++    const uint32_t* direct = nullptr;
++    const uint64_t* packed = nullptr;
++    std::ptrdiff_t count = 0;
++
++    template <class Visit>
++    void forEach(Visit visit) const {
++        if (direct) {
++            for (std::ptrdiff_t i = 0; i < count; ++i) visit(direct[i]);
++        } else {
++            for (std::ptrdiff_t i = 0; i < count; ++i) visit(static_cast<uint32_t>(packed[i]));
++        }
++    }
++};
++
++// Direktni indeks: positions[offsets[code] .. offsets[code + 1]) za svaki k-mer.
++// Za k > 13 ostaje sortirani indeks zbog rasta tabele s 4^k.
+ struct KmerIndex {
+     int k = 12;
+-    std::vector<uint64_t> e;
++
+     void build(EncodedView ref, int k_) {
+-        k = k_; e.clear();
++        k = k_;
++        if (k > 13 || ref.size() > std::numeric_limits<uint32_t>::max()) {
++            offsets = std::vector<uint32_t>{};
++            positions = std::vector<uint32_t>{};
++            packed.clear();
++            forEachKmer(ref, [&](uint64_t code, uint32_t pos) {
++                packed.push_back((code << 32) | pos);
++            });
++            std::sort(packed.begin(), packed.end());
++            return;
++        }
++
++        packed = std::vector<uint64_t>{};
++        const size_t codeCount = size_t{1} << (2 * k);
++        offsets.assign(codeCount + 1, 0);
++        forEachKmer(ref, [&](uint64_t code, uint32_t) { ++offsets[code + 1]; });
++        for (size_t i = 1; i < offsets.size(); ++i) offsets[i] += offsets[i - 1];
++
++        positions.resize(offsets.back());
++        forEachKmer(ref, [&](uint64_t code, uint32_t pos) {
++            positions[offsets[code]++] = pos;
++        });
++        // Kursori sada pokazuju krajeve raspona. Pomjeri ih za jedno mjesto.
++        std::move_backward(offsets.begin(), offsets.end() - 1, offsets.end());
++        offsets.front() = 0;
++    }
++
++    void build(const std::string& ref, int k_) {
++        const auto encoded = encodeSequence(ref);
++        build(EncodedView{encoded}, k_);
++    }
++
++    size_t size() const { return positions.size() + packed.size(); }
++
++    KmerPositions lookup(uint64_t code) const {
++        if (offsets.empty()) {
++            auto lo = std::lower_bound(packed.begin(), packed.end(), code << 32);
++            auto hi = std::lower_bound(lo, packed.end(), (code + 1) << 32);
++            if (lo == hi) return {};
++            return {nullptr, &*lo, hi - lo};
++        }
++        if (code >= offsets.size() - 1) return {};
++        const uint32_t begin = offsets[code];
++        const uint32_t end = offsets[code + 1];
++        if (begin == end) return {};
++        return {positions.data() + begin, nullptr, static_cast<std::ptrdiff_t>(end - begin)};
++    }
++
++private:
++    std::vector<uint32_t> offsets, positions;
++    std::vector<uint64_t> packed;
++
++    template <class Visit>
++    void forEachKmer(EncodedView ref, Visit visit) const {
+         const uint64_t mask = (1ULL << (2 * k)) - 1;
+         uint64_t code = 0; int valid = 0;
+         for (size_t i = 0; i < ref.size(); ++i) {
+             const Base c = ref[i];
+             if (!isCanonical(c)) { valid = 0; code = 0; continue; }
+             code = ((code << 2) | (uint64_t)c) & mask;
+-            if (++valid >= k) e.push_back((code << 32) | (uint32_t)(i - k + 1));
++            if (++valid >= k) visit(code, static_cast<uint32_t>(i - k + 1));
+         }
+-        std::sort(e.begin(), e.end());
+-    }
+-    void build(const std::string& ref, int k_) {
+-        const auto encoded = encodeSequence(ref);
+-        build(EncodedView{encoded}, k_);
+-    }
+-    std::pair<std::vector<uint64_t>::const_iterator, std::vector<uint64_t>::const_iterator>
+-    lookup(uint64_t code) const {
+-        auto lo = std::lower_bound(e.begin(), e.end(), code << 32);
+-        auto hi = std::lower_bound(lo, e.end(), (code + 1) << 32);
+-        return {lo, hi};
+     }
+ };
+ 
+@@ -121,9 +182,9 @@ inline std::vector<std::pair<int64_t, int>> findCandidates(EncodedView seq, cons
+         if (++valid < k) continue;
+         int64_t off = (int64_t)i - k + 1;
+         if (off % p.stride) continue;
+-        auto r = idx.lookup(code);
+-        if (r.second - r.first > p.maxOcc) continue;
+-        for (auto it = r.first; it != r.second; ++it) diags.push_back((int64_t)(uint32_t)(*it) - off);
++        const auto matches = idx.lookup(code);
++        if (matches.count > p.maxOcc) continue;
++        matches.forEach([&](uint32_t pos) { diags.push_back((int64_t)pos - off); });
+     }
+     std::sort(diags.begin(), diags.end());
+     struct Cl { int64_t diag; int votes; int bestRun; };

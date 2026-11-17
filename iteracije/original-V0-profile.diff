@@ -1,0 +1,52 @@
+diff --git a/PROJEKAT - bez optimizacije/mapper.cpp b/V0/mapper.cpp
+index af9a171..9f2f725 100644
+--- a/PROJEKAT - bez optimizacije/mapper.cpp	
++++ b/V0/mapper.cpp
+@@ -9,8 +9,11 @@
+ #include <fstream>
+ #include <iostream>
+ #include <map>
++#include <cstdint>
++#include <cstdlib>
+ #include "fasta.hpp"
+ #include "mapper.hpp"
++
+ using namespace sw;
+ using clk = std::chrono::steady_clock;
+ static double since(clk::time_point t) { return std::chrono::duration<double>(clk::now() - t).count(); }
+@@ -18,8 +21,9 @@ static double since(clk::time_point t) { return std::chrono::duration<double>(cl
+ int main(int argc, char** argv) {
+     std::map<std::string, std::string> o = {{"out", "results/map.tsv"}, {"k", "12"}, {"match", "3"}, {"mismatch", "-3"},
+         {"gap", "2"}, {"margin", "20"}, {"min-votes", "2"}, {"max-cand", "5"}, {"min-score", "0.5"}, {"tol", "10"},
+-        {"max-occ", "500"}, {"eval", "1"}};
++        {"max-occ", "500"}, {"eval", "1"}, {"profile", "0"}};
+     for (int i = 1; i + 1 < argc; i += 2) o[std::string(argv[i]).substr(2)] = argv[i + 1];
++    const bool profile = o["profile"] == "1";
+     if (!o.count("ref") || !o.count("reads")) { std::cerr << "Potrebno: --ref <fasta> --reads <fastq/fasta>\n"; return 1; }
+ 
+     MapParams p;
+@@ -42,6 +46,24 @@ int main(int argc, char** argv) {
+     for (size_t i = 0; i < reads.size(); ++i) res[i] = mapRead(reads[i].seq, idx, ref, p, st);
+     double tMap = since(t);
+ 
++    if (profile) {
++        std::uint64_t checksum = 0;
++
++        for (const auto& r : res) {
++            checksum = checksum * 31
++                + static_cast<std::uint64_t>(r.pos)
++                + static_cast<std::uint64_t>(r.score);
++        }
++
++        std::fprintf(
++            stderr,
++            "Checksum: %llx\n",
++            static_cast<unsigned long long>(checksum)
++        );
++
++        return 0;
++    }
++
+     t = clk::now();
+     { std::ofstream f(o["out"]);
+       if (!f) { std::cerr << "Ne mogu pisati u " << o["out"] << " (napravi direktorij)\n"; return 1; }

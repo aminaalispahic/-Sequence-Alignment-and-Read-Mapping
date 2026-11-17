@@ -1,0 +1,116 @@
+diff --git "a/V6\\mapper.cpp" "b/V7\\mapper.cpp"
+index 0be5220..97704ed 100644
+--- "a/V6\\mapper.cpp"
++++ "b/V7\\mapper.cpp"
+@@ -2,7 +2,7 @@
+ // Upotreba:
+ //   ./mapper --ref data/sim_ref.fa --reads data/sim_reads.fq --out results/map.tsv
+ //            [--k 12] [--match 3] [--mismatch -3] [--gap 2] [--margin 20] [--min-votes 2]
+-//            [--max-cand 5] [--min-score 0.5] [--tol 10] [--eval 1] [--band 12]
++//            [--max-cand 5] [--min-score 0.5] [--tol 10] [--eval 1] [--band 12] [--rel-votes 0.5]
+ // Izlaz (TSV): read_id  strand  pos  score  cigar  status   (pos je 0-indeksirana)
+ #include <chrono>
+ #include <cstdio>
+@@ -21,7 +21,7 @@ static double since(clk::time_point t) { return std::chrono::duration<double>(cl
+ int main(int argc, char** argv) {
+     std::map<std::string, std::string> o = {{"out", "results/map.tsv"}, {"k", "12"}, {"match", "3"}, {"mismatch", "-3"},
+         {"gap", "2"}, {"margin", "20"}, {"min-votes", "2"}, {"max-cand", "5"}, {"min-score", "0.5"}, {"tol", "10"},
+-        {"max-occ", "500"}, {"eval", "1"}, {"profile", "0"}, {"band", "12"}};
++        {"max-occ", "500"}, {"eval", "1"}, {"profile", "0"}, {"band", "12"}, {"rel-votes", "0.5"}};
+     for (int i = 1; i + 1 < argc; i += 2) o[std::string(argv[i]).substr(2)] = argv[i + 1];
+     const bool profile = o["profile"] == "1";
+     if (!o.count("ref") || !o.count("reads")) { std::cerr << "Potrebno: --ref <fasta> --reads <fastq/fasta>\n"; return 1; }
+@@ -33,6 +33,13 @@ int main(int argc, char** argv) {
+     if (p.k < 1 || p.k > 16) { std::cerr << "k mora biti u [1,16]\n"; return 1; }
+     p.band = std::stoi(o["band"]);
+     if (p.band < -1) { std::cerr << "band mora biti -1 ili nenegativan\n"; return 1; }
++    const char* relVotes = o["rel-votes"].c_str();
++    char* relVotesEnd = nullptr;
++    p.relVotes = std::strtod(relVotes, &relVotesEnd);
++    if (relVotesEnd == relVotes || *relVotesEnd != '\0' || !(p.relVotes >= 0 && p.relVotes <= 1)) {
++        std::cerr << "rel-votes mora biti broj u [0,1]\n";
++        return 1;
++    }
+ 
+     auto T0 = clk::now(); auto t = T0;
+     std::string refBases;
+@@ -101,5 +108,7 @@ int main(int argc, char** argv) {
+                  (unsigned long long)st.extensions, (unsigned long long)st.cells, st.extSec > 0 ? st.cells / st.extSec / 1e9 : 0.0);
+     std::fprintf(stderr, "SW prolazi: score-only %llu | puni traceback %llu\n",
+                  (unsigned long long)(st.extensions - st.tracebacks), (unsigned long long)st.tracebacks);
++    std::fprintf(stderr, "Kandidati: prije relativnog praga %llu | poslije %llu\n",
++                 (unsigned long long)st.candidatesBeforeRelVotes, (unsigned long long)st.candidatesAfterRelVotes);
+     return 0;
+ }
+diff --git "a/V6\\mapper.hpp" "b/V7\\mapper.hpp"
+index d8376ab..b6df12d 100644
+--- "a/V6\\mapper.hpp"
++++ "b/V7\\mapper.hpp"
+@@ -1,6 +1,7 @@
+ // mapper.hpp: k-mer indeks, seeding, extension (Smith-Waterman) i izbor najboljeg mapiranja
+ #pragma once
+ #include <algorithm>
++#include <array>
+ #include <chrono>
+ #include <cstddef>
+ #include <cstdint>
+@@ -153,6 +154,7 @@ struct MapParams {
+     double minScoreFrac = 0.5;  // minimalni skor = frac * dužina * match
+     Scoring sc;
+     int band = 12;               // polu-sirina oko seed dijagonale, -1 = puna matrica
++    double relVotes = 0.5;       // udio najboljeg broja glasova na oba lanca
+ };
+ 
+ struct MapResult {
+@@ -168,6 +170,7 @@ struct Stats {
+     double seedSec = 0, extSec = 0;
+     uint64_t cells = 0, extensions = 0, tracebacks = 0;
+     SwWorkspace swWorkspace;
++    uint64_t candidatesBeforeRelVotes = 0, candidatesAfterRelVotes = 0;
+ };
+ 
+ // Seeding: sve k-mere reada -> pozicije u indeksu -> glasanje po dijagonali (p - offset).
+@@ -290,26 +293,35 @@ inline MapResult mapRead(EncodedView read, EncodedView rc, const KmerIndex& idx,
+                          const MapParams& p, Stats& st) {
+     using clk = std::chrono::steady_clock;
+     auto secs = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double>(b - a).count(); };
++
++    const auto seedStart = clk::now();
++    const std::array candidates{findCandidates(read, idx, p), findCandidates(rc, idx, p)};
++    // Svaki niz vec je sortiran po glasovima i ogranicen na maxCand.
++    const int forwardVotes = candidates[0].empty() ? 0 : candidates[0].front().second;
++    const int reverseVotes = candidates[1].empty() ? 0 : candidates[1].front().second;
++    const int bestVotes = std::max(forwardVotes, reverseVotes);
++    const int threshold = std::max(p.minVotes, static_cast<int>(p.relVotes * bestVotes));
++    st.candidatesBeforeRelVotes += candidates[0].size() + candidates[1].size();
++    const auto extensionStart = clk::now();
++    st.seedSec += secs(seedStart, extensionStart);
++
+     std::vector<CandidateWindow> windows;
+     int ncand = 0;
+     for (int s = 0; s < 2; ++s) {                       // oba lanca: read i njegov reverse-complement
+         const auto seq = (s == 0) ? read : rc;
+-        auto t0 = clk::now();
+-        auto cands = findCandidates(seq, idx, p);
+-        auto t1 = clk::now(); st.seedSec += secs(t0, t1);
+-        ncand += (int)cands.size();
+-        for (const auto& c : cands) {
++        for (const auto& c : candidates[s]) {
++            if (c.second < threshold) break;
++            ++ncand;
+             int64_t rs = std::max<int64_t>(0, c.first - p.margin);
+             int64_t re = std::min<int64_t>((int64_t)ref.size(), c.first + (int64_t)seq.size() + p.margin);
+             if (re <= rs) continue;
+             const auto region = ref.substr((size_t)rs, (size_t)(re - rs));
+             windows.push_back({seq, region, rs, c.first - rs, s == 0 ? '+' : '-'});
+         }
+-        st.extSec += secs(t1, clk::now());
+     }
+-    const auto t0 = clk::now();
++    st.candidatesAfterRelVotes += ncand;
+     auto result = selectBestCandidate(windows, ncand, read.size(), p, st);
+-    st.extSec += secs(t0, clk::now());
++    st.extSec += secs(extensionStart, clk::now());
+     return result;
+ }
+ 

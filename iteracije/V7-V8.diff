@@ -1,0 +1,143 @@
+diff --git a/V7/mapper.hpp b/V8/mapper.hpp
+index b6df12d..0d58590 100644
+--- a/V7/mapper.hpp
++++ b/V8/mapper.hpp
+@@ -63,6 +63,12 @@ struct KmerPositions {
+     const uint64_t* packed = nullptr;
+     std::ptrdiff_t count = 0;
+ 
++    void prefetchFirst() const {
++#if defined(__GNUC__) || defined(__clang__)
++        if (direct) __builtin_prefetch(direct, 0, 1);
++#endif
++    }
++
+     template <class Visit>
+     void forEach(Visit visit) const {
+         if (direct) {
+@@ -113,6 +119,15 @@ struct KmerIndex {
+ 
+     size_t size() const { return positions.size() + packed.size(); }
+ 
++    void prefetchOffsets(uint64_t code) const {
++#if defined(__GNUC__) || defined(__clang__)
++        if (!offsets.empty() && code < offsets.size() - 1)
++            __builtin_prefetch(offsets.data() + code, 0, 1);
++#else
++        (void)code;
++#endif
++    }
++
+     KmerPositions lookup(uint64_t code) const {
+         if (offsets.empty()) {
+             auto lo = std::lower_bound(packed.begin(), packed.end(), code << 32);
+@@ -166,16 +181,41 @@ struct MapResult {
+     int candidates = 0;
+ };
+ 
++using SeedCandidate = std::pair<int64_t, int>;
++
++struct SeedWorkspace {
++    struct Seed { uint64_t code; int64_t readOffset; };
++    struct Match { KmerPositions positions; int64_t readOffset; };
++    struct Cluster { int64_t diag; int votes; int bestRun; };
++
++    std::vector<Seed> seeds;
++    std::vector<Match> matches;
++    std::vector<int64_t> diags;
++    std::vector<Cluster> clusters;
++    std::array<std::vector<SeedCandidate>, 2> candidates;
++};
++
+ struct Stats {
+     double seedSec = 0, extSec = 0;
+     uint64_t cells = 0, extensions = 0, tracebacks = 0;
+     SwWorkspace swWorkspace;
+     uint64_t candidatesBeforeRelVotes = 0, candidatesAfterRelVotes = 0;
++    SeedWorkspace seedWorkspace;
+ };
+ 
+-// Seeding: sve k-mere reada -> pozicije u indeksu -> glasanje po dijagonali (p - offset).
+-inline std::vector<std::pair<int64_t, int>> findCandidates(EncodedView seq, const KmerIndex& idx, const MapParams& p) {
+-    std::vector<int64_t> diags;
++inline void findCandidates(EncodedView seq, const KmerIndex& idx, const MapParams& p,
++                           SeedWorkspace& workspace, std::vector<SeedCandidate>& out) {
++    auto& seeds = workspace.seeds;
++    auto& matches = workspace.matches;
++    auto& diags = workspace.diags;
++    auto& cl = workspace.clusters;
++    seeds.clear();
++    matches.clear();
++    diags.clear();
++    cl.clear();
++    out.clear();
++
++    // Prvo izracunaj kodove k-mera i zatrazi njihove offsete.
+     const int k = idx.k;
+     const uint64_t mask = (1ULL << (2 * k)) - 1;
+     uint64_t code = 0; int valid = 0;
+@@ -184,26 +224,44 @@ inline std::vector<std::pair<int64_t, int>> findCandidates(EncodedView seq, cons
+         if (!isCanonical(c)) { valid = 0; code = 0; continue; }
+         code = ((code << 2) | (uint64_t)c) & mask;
+         if (++valid < k) continue;
+-        int64_t off = (int64_t)i - k + 1;
++        const int64_t off = (int64_t)i - k + 1;
+         if (off % p.stride) continue;
+-        const auto matches = idx.lookup(code);
+-        if (matches.count > p.maxOcc) continue;
+-        matches.forEach([&](uint32_t pos) { diags.push_back((int64_t)pos - off); });
++        seeds.push_back({code, off});
++        idx.prefetchOffsets(code);
++    }
++
++    // Zatim procitaj raspone i zatrazi pocetak niza pozicija.
++    for (const auto& seed : seeds) {
++        const auto positions = idx.lookup(seed.code);
++        if (positions.count == 0 || positions.count > p.maxOcc) continue;
++        positions.prefetchFirst();
++        matches.push_back({positions, seed.readOffset});
++    }
++
++    // Na kraju procitaj pozicije i izracunaj dijagonale.
++    for (const auto& match : matches) {
++        match.positions.forEach([&](uint32_t pos) {
++            diags.push_back((int64_t)pos - match.readOffset);
++        });
+     }
+     std::sort(diags.begin(), diags.end());
+-    struct Cl { int64_t diag; int votes; int bestRun; };
+-    std::vector<Cl> cl; int64_t last = 0;
++    int64_t last = 0;
+     for (size_t i = 0; i < diags.size();) {
+         size_t j = i; while (j < diags.size() && diags[j] == diags[i]) ++j;
+         int cnt = (int)(j - i); int64_t d = diags[i];
+         if (cl.empty() || d - last > p.margin) cl.push_back({d, cnt, cnt});
+-        else { Cl& c = cl.back(); c.votes += cnt; if (cnt > c.bestRun) { c.bestRun = cnt; c.diag = d; } }
++        else { auto& c = cl.back(); c.votes += cnt; if (cnt > c.bestRun) { c.bestRun = cnt; c.diag = d; } }
+         last = d; i = j;
+     }
+-    std::vector<std::pair<int64_t, int>> out;
+     for (auto& c : cl) if (c.votes >= p.minVotes) out.push_back({c.diag, c.votes});
+     std::sort(out.begin(), out.end(), [](auto& x, auto& y) { return x.second > y.second; });
+     if ((int)out.size() > p.maxCand) out.resize(p.maxCand);
++}
++
++inline std::vector<SeedCandidate> findCandidates(EncodedView seq, const KmerIndex& idx, const MapParams& p) {
++    SeedWorkspace workspace;
++    std::vector<SeedCandidate> out;
++    findCandidates(seq, idx, p, workspace, out);
+     return out;
+ }
+ 
+@@ -295,7 +353,10 @@ inline MapResult mapRead(EncodedView read, EncodedView rc, const KmerIndex& idx,
+     auto secs = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double>(b - a).count(); };
+ 
+     const auto seedStart = clk::now();
+-    const std::array candidates{findCandidates(read, idx, p), findCandidates(rc, idx, p)};
++    auto& workspace = st.seedWorkspace;
++    auto& candidates = workspace.candidates;
++    findCandidates(read, idx, p, workspace, candidates[0]);
++    findCandidates(rc, idx, p, workspace, candidates[1]);
+     // Svaki niz vec je sortiran po glasovima i ogranicen na maxCand.
+     const int forwardVotes = candidates[0].empty() ? 0 : candidates[0].front().second;
+     const int reverseVotes = candidates[1].empty() ? 0 : candidates[1].front().second;

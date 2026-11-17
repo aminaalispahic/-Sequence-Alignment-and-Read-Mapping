@@ -1,0 +1,134 @@
+diff --git "a/V1\\align.hpp" "b/V2\\align.hpp"
+index 3471513..06e6bfa 100644
+--- "a/V1\\align.hpp"
++++ "b/V2\\align.hpp"
+@@ -37,35 +37,78 @@ inline std::string makeCigar(const std::string& a, const std::string& b) {
+     return out;
+ }
+ 
+-// Smith-Waterman: puna matrica + traceback od maksimuma do nule.
+-inline Alignment smithWaterman(const std::string& X, std::string_view Y, const Scoring& sc) {
++struct SwWorkspace {
++    std::vector<int> previous, current;
++    std::vector<uint8_t> directions;
++};
++
++// Smith-Waterman: dva reda skorova i puna matrica smjerova za traceback.
++inline Alignment smithWaterman(const std::string& X, std::string_view Y,
++                               const Scoring& sc, SwWorkspace& workspace) {
+     const int n = (int)X.size(), m = (int)Y.size();
+-    const size_t W = (size_t)m + 1;
+-    std::vector<int> H((n + 1) * W, 0);                       // prvi red i kolona = 0
+-    std::vector<uint8_t> T((n + 1) * W, STOP);
+-    int best = 0, bi = 0, bj = 0;
+-    for (int i = 1; i <= n; ++i)
++    const size_t width = (size_t)m + 1;
++
++    auto& previous = workspace.previous;
++    auto& current = workspace.current;
++    auto& directions = workspace.directions;
++    previous.resize(width);
++    current.resize(width);
++    directions.resize(((size_t)n + 1) * width);
++    std::fill(previous.begin(), previous.end(), 0);
++
++    int best = 0, bestI = 0, bestJ = 0;
++    for (int i = 1; i <= n; ++i) {
++        current[0] = 0;
+         for (int j = 1; j <= m; ++j) {
+-            int d = H[(i-1)*W + j-1] + sub(X[i-1], Y[j-1], sc);
+-            int u = H[(i-1)*W + j] - sc.gap;
+-            int l = H[i*W + j-1] - sc.gap;
+-            int h = std::max(std::max(0, d), std::max(u, l));
+-            H[i*W + j] = h;
+-            T[i*W + j] = (h == 0) ? STOP : (h == d) ? DIAG : (h == u) ? UP : LEFT;
+-            if (h > best) { best = h; bi = i; bj = j; }
++            const int d = previous[j - 1] + sub(X[i - 1], Y[j - 1], sc);
++            const int u = previous[j] - sc.gap;
++            const int l = current[j - 1] - sc.gap;
++            const int h = std::max(std::max(0, d), std::max(u, l));
++
++            current[j] = h;
++            directions[(size_t)i * width + j] =
++                (h == 0) ? STOP : (h == d) ? DIAG : (h == u) ? UP : LEFT;
++            if (h > best) {
++                best = h;
++                bestI = i;
++                bestJ = j;
++            }
+         }
+-    Alignment r; r.score = best; r.endX = bi; r.endY = bj;
+-    int i = bi, j = bj;
+-    while (i > 0 && j > 0 && H[i*W + j] > 0) {
+-        uint8_t t = T[i*W + j];
+-        if (t == DIAG)    { r.a += X[i-1]; r.b += Y[j-1]; --i; --j; }
+-        else if (t == UP) { r.a += X[i-1]; r.b += '-';    --i; }
+-        else              { r.a += '-';    r.b += Y[j-1]; --j; }
++        previous.swap(current);
+     }
+-    r.startX = i; r.startY = j;
+-    std::reverse(r.a.begin(), r.a.end()); std::reverse(r.b.begin(), r.b.end());
+-    r.cigar = makeCigar(r.a, r.b);
+-    return r;
++
++    Alignment result;
++    result.score = best;
++    result.endX = bestI;
++    result.endY = bestJ;
++    int i = bestI, j = bestJ;
++    while (i > 0 && j > 0) {
++        const uint8_t direction = directions[(size_t)i * width + j];
++        if (direction == STOP) break;
++
++        if (direction == DIAG) {
++            result.a += X[--i];
++            result.b += Y[--j];
++        } else if (direction == UP) {
++            result.a += X[--i];
++            result.b += '-';
++        } else {
++            result.a += '-';
++            result.b += Y[--j];
++        }
++    }
++
++    result.startX = i;
++    result.startY = j;
++    std::reverse(result.a.begin(), result.a.end());
++    std::reverse(result.b.begin(), result.b.end());
++    result.cigar = makeCigar(result.a, result.b);
++    return result;
++}
++
++inline Alignment smithWaterman(const std::string& X, std::string_view Y, const Scoring& sc) {
++    SwWorkspace workspace;
++    return smithWaterman(X, Y, sc, workspace);
+ }
+ 
+ // Smith-Waterman samo skor: dva reda, O(m) memorije.
+diff --git "a/V1\\mapper.hpp" "b/V2\\mapper.hpp"
+index f914450..cf7e79c 100644
+--- "a/V1\\mapper.hpp"
++++ "b/V2\\mapper.hpp"
+@@ -64,7 +64,11 @@ struct MapResult {
+     int candidates = 0;
+ };
+ 
+-struct Stats { double seedSec = 0, extSec = 0; uint64_t cells = 0, extensions = 0; };
++struct Stats {
++    double seedSec = 0, extSec = 0;
++    uint64_t cells = 0, extensions = 0;
++    SwWorkspace swWorkspace;
++};
+ 
+ // Seeding: sve k-mere reada -> pozicije u indeksu -> glasanje po dijagonali (p - offset).
+ inline std::vector<std::pair<int64_t, int>> findCandidates(const std::string& seq, const KmerIndex& idx, const MapParams& p) {
+@@ -119,7 +123,7 @@ inline MapResult mapRead(const std::string& read, const KmerIndex& idx, const st
+             int64_t re = std::min<int64_t>((int64_t)ref.size(), c.first + (int64_t)seq.size() + p.margin);
+             if (re <= rs) continue;
+             const auto region = std::string_view(ref).substr((size_t)rs, (size_t)(re - rs));
+-            Alignment a = smithWaterman(seq, region, p.sc);   // extension
++            Alignment a = smithWaterman(seq, region, p.sc, st.swWorkspace);   // extension
+             st.cells += (uint64_t)seq.size() * (uint64_t)(re - rs); ++st.extensions;
+             if (a.score <= 0) continue;
+             std::string cig;
